@@ -8,7 +8,9 @@
 import Foundation
 import CoreBluetooth
 import Combine
+#if canImport(UIKit)
 import UIKit // For alert prompting
+#endif
 
 public extension FlySightCore {
 
@@ -302,6 +304,7 @@ public extension FlySightCore {
             DispatchQueue.main.async {
                 self.knownPeripherals.removeAll { $0.id == peripheralInfo.id }
 
+                #if canImport(UIKit)
                 let alert = UIAlertController(
                     title: "Device Forgotten",
                     message: "\(deviceName) has been removed from this app. For a complete unpair:\n1. Go to iPhone Settings > Bluetooth.\n2. Find \(deviceName), tap 'ⓘ', then 'Forget This Device'.\n3. On FlySight: Connect via USB, edit FLYSIGHT.TXT, set Reset_BLE=1, save, eject.",
@@ -310,9 +313,13 @@ public extension FlySightCore {
                 alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completion() })
 
                 self.presentAlert(alert)
+                #else
+                completion()
+                #endif
             }
         }
 
+        #if canImport(UIKit)
         private func presentAlert(_ alertController: UIAlertController) {
             DispatchQueue.main.async {
                 guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
@@ -328,6 +335,7 @@ public extension FlySightCore {
                 presentingController.present(alertController, animated: true)
             }
         }
+        #endif
 
         // MARK: - CBCentralManagerDelegate
         public func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -349,26 +357,32 @@ public extension FlySightCore {
                     self.knownPeripherals.indices.forEach { self.knownPeripherals[$0].isConnected = false }
                     self.discoveredPairingPeripherals = []
                     self.connectionState = .idle
+                    #if canImport(UIKit)
                     let alert = UIAlertController(title: "Bluetooth Off", message: "Please turn on Bluetooth to use FlySight features.", preferredStyle: .alert)
                     alert.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))
                     self.presentAlert(alert)
+                    #endif
                 case .resetting:
                     print("Bluetooth is resetting.")
                 case .unauthorized:
                     print("Bluetooth use unauthorized.")
                     self.connectionState = .idle
+                    #if canImport(UIKit)
                      let alert = UIAlertController(title: "Bluetooth Unauthorized", message: "This app needs Bluetooth permission. Please enable it in Settings.", preferredStyle: .alert)
                     alert.addAction(UIAlertAction(title: "Settings", style: .default) { _ in
                         if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
                     })
                     alert.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
                     self.presentAlert(alert)
+                    #endif
                 case .unsupported:
                     print("Bluetooth is unsupported on this device.")
                     self.connectionState = .idle
+                    #if canImport(UIKit)
                     let alert = UIAlertController(title: "Bluetooth Unsupported", message: "This device does not support Bluetooth Low Energy.", preferredStyle: .alert)
                     alert.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))
                     self.presentAlert(alert)
+                    #endif
                 default:
                     print("Bluetooth state unknown or new: \(central.state)")
                 }
