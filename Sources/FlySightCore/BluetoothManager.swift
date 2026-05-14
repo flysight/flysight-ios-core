@@ -1149,11 +1149,24 @@ public extension FlySightCore {
         }
 
         public func downloadFile(at remotePath: String, knownSize: UInt32, completion: @escaping (Result<Data, Error>) -> Void) {
-            guard let peripheral = connectedPeripheralInfo?.peripheral,
-                  let rxChar = ftPacketInCharacteristic,
-                  let txChar = ftPacketOutCharacteristic
-            else {
-                completion(.failure(BluetoothError.notConnectedOrCharsMissing))
+            guard let peripheral = connectedPeripheralInfo?.peripheral else {
+                completion(.failure(BluetoothError.notConnected))
+                return
+            }
+            guard let rxChar = ftPacketInCharacteristic else {
+                completion(.failure(BluetoothError.missingCharacteristic(
+                    name: "FT_Packet_In",
+                    uuid: FlySightCore.FT_PACKET_IN_UUID.uuidString,
+                    hint: "File transfer is unavailable without this characteristic."
+                )))
+                return
+            }
+            guard let txChar = ftPacketOutCharacteristic else {
+                completion(.failure(BluetoothError.missingCharacteristic(
+                    name: "FT_Packet_Out",
+                    uuid: FlySightCore.FT_PACKET_OUT_UUID.uuidString,
+                    hint: "File transfer is unavailable without this characteristic."
+                )))
                 return
             }
 
@@ -1247,12 +1260,19 @@ public extension FlySightCore {
         }
 
         private func performFileTransferCommand(_ command: Data, expectedResponseTo expectedOpcode: UInt8, tolerateNAK: Bool = false) async throws {
-            guard let peripheral = connectedPeripheralInfo?.peripheral,
-                  let rxChar = ftPacketInCharacteristic,
-                  let txChar = ftPacketOutCharacteristic
-            else {
-                throw BluetoothError.notConnectedOrCharsMissing
-            }
+            let peripheral = try requireConnectedPeripheral()
+            let rxChar = try requireCharacteristic(
+                ftPacketInCharacteristic,
+                name: "FT_Packet_In",
+                uuid: FlySightCore.FT_PACKET_IN_UUID,
+                hint: "File transfer commands are unavailable without this characteristic."
+            )
+            let txChar = try requireCharacteristic(
+                ftPacketOutCharacteristic,
+                name: "FT_Packet_Out",
+                uuid: FlySightCore.FT_PACKET_OUT_UUID,
+                hint: "File transfer responses are unavailable without this characteristic."
+            )
 
             guard notificationHandlers[txChar.uuid] == nil else {
                 throw FlySightCore.FirmwareUpdateBLEError.fileTransferOperationInProgress
@@ -1317,12 +1337,19 @@ public extension FlySightCore {
 
 
         public func uploadFile(fileData: Data, remotePath: String) async throws {
-             guard let peripheral = connectedPeripheralInfo?.peripheral,
-                  let rxChar = ftPacketInCharacteristic,
-                  let txChar = ftPacketOutCharacteristic
-            else {
-                throw BluetoothError.notConnectedOrCharsMissing
-            }
+            let peripheral = try requireConnectedPeripheral()
+            let rxChar = try requireCharacteristic(
+                ftPacketInCharacteristic,
+                name: "FT_Packet_In",
+                uuid: FlySightCore.FT_PACKET_IN_UUID,
+                hint: "File upload is unavailable without this characteristic."
+            )
+            let txChar = try requireCharacteristic(
+                ftPacketOutCharacteristic,
+                name: "FT_Packet_Out",
+                uuid: FlySightCore.FT_PACKET_OUT_UUID,
+                hint: "File upload acknowledgements are unavailable without this characteristic."
+            )
 
             guard !isUploading, uploadContinuation == nil, notificationHandlers[txChar.uuid] == nil else {
                 throw FlySightCore.FirmwareUpdateBLEError.fileTransferOperationInProgress
@@ -1528,11 +1555,13 @@ public extension FlySightCore {
 
         // MARK: - Firmware Update
         public func installUploadedFirmware() async throws {
-            guard let peripheral = connectedPeripheralInfo?.peripheral,
-                  let controlChar = dsControlPointCharacteristic
-            else {
-                throw BluetoothError.notConnectedOrCharsMissing
-            }
+            let peripheral = try requireConnectedPeripheral()
+            let controlChar = try requireCharacteristic(
+                dsControlPointCharacteristic,
+                name: "DS_Control_Point",
+                uuid: FlySightCore.DS_CONTROL_POINT_UUID,
+                hint: "This FlySight firmware may not support starting an uploaded firmware install over BLE. Firmware v2024.12.30.8 and earlier may require the older USB update flow for this final install step."
+            )
 
             guard installUploadedFirmwareContinuation == nil else {
                 throw FlySightCore.FirmwareUpdateBLEError.fileTransferOperationInProgress
@@ -1597,6 +1626,29 @@ public extension FlySightCore {
             if let controlChar = dsControlPointCharacteristic {
                 notificationHandlers[controlChar.uuid] = nil
             }
+        }
+
+        private func requireConnectedPeripheral() throws -> CBPeripheral {
+            guard let peripheral = connectedPeripheralInfo?.peripheral else {
+                throw BluetoothError.notConnected
+            }
+            return peripheral
+        }
+
+        private func requireCharacteristic(
+            _ characteristic: CBCharacteristic?,
+            name: String,
+            uuid: CBUUID,
+            hint: String
+        ) throws -> CBCharacteristic {
+            guard let characteristic = characteristic else {
+                throw BluetoothError.missingCharacteristic(
+                    name: name,
+                    uuid: uuid.uuidString,
+                    hint: hint
+                )
+            }
+            return characteristic
         }
 
 
@@ -1886,12 +1938,18 @@ public extension FlySightCore {
 
 public enum BluetoothError: Error, LocalizedError {
     case notConnectedOrCharsMissing
+    case notConnected
+    case missingCharacteristic(name: String, uuid: String, hint: String)
     case deallocated
     case uploadFailed(String)
 
     public var errorDescription: String? {
         switch self {
         case .notConnectedOrCharsMissing: return "Not connected to FlySight or essential Bluetooth characteristics are missing."
+        case .notConnected:
+            return "Not connected to a FlySight."
+        case .missingCharacteristic(let name, let uuid, let hint):
+            return "Missing required Bluetooth characteristic \(name) (\(uuid)). \(hint)"
         case .deallocated: return "The Bluetooth manager was deallocated."
         case .uploadFailed(let reason): return "Upload failed: \(reason)"
         }
