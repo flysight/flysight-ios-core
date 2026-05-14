@@ -222,13 +222,30 @@ public struct FirmwareEndpointError: Decodable, Error, Equatable {
     }
 }
 
-public enum FirmwareUpdateClientError: Error, Equatable {
+public enum FirmwareUpdateClientError: Error, Equatable, LocalizedError {
     case invalidResponse
     case endpoint(FirmwareEndpointError, statusCode: Int)
     case httpStatus(Int)
     case emptyFirmwareList
     case downloadSizeMismatch(expected: Int, actual: Int)
     case downloadSHA256Mismatch(expected: String, actual: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidResponse:
+            return "The firmware server returned an invalid response."
+        case .endpoint(let error, _):
+            return error.message
+        case .httpStatus(let status):
+            return "The firmware server returned HTTP \(status)."
+        case .emptyFirmwareList:
+            return "No compatible firmware files were returned."
+        case .downloadSizeMismatch(let expected, let actual):
+            return "Downloaded file size did not match. Expected \(expected) bytes, got \(actual) bytes."
+        case .downloadSHA256Mismatch:
+            return "Downloaded file verification failed."
+        }
+    }
 }
 
 public struct FirmwareUpdateClient {
