@@ -68,6 +68,7 @@ public extension FlySightCore {
         @Published public var connectionState: ConnectionState = .idle
         @Published public var flysightModelName: String?
         @Published public var flysightFirmwareVersion: String?
+        @Published public var deviceMode: FlySightCore.DeviceMode?
 
         // File Management
         @Published public var directoryEntries: [DirectoryEntry] = []
@@ -96,6 +97,8 @@ public extension FlySightCore {
         private var uploadTask: Task<Void, Never>?
         private var uploadContinuation: CheckedContinuation<Void, Error>?
         private var installUploadedFirmwareContinuation: CheckedContinuation<Void, Error>?
+        private var deviceModeReadContinuation: CheckedContinuation<FlySightCore.DeviceMode, Error>?
+        private var deviceStateControlPointWriteErrorHandler: ((Error) -> Void)?
         private var isInstallingUploadedFirmware = false
 
         private var pingTimer: Timer?
@@ -180,9 +183,13 @@ public extension FlySightCore {
                 self.firmwareRevisionCharacteristic = nil
                 self.flysightModelName = nil
                 self.flysightFirmwareVersion = nil
+                self.deviceMode = nil
 
                 self.stopPingTimer()
                 self.notificationHandlers.removeAll()
+                self.deviceModeReadContinuation?.resume(throwing: BluetoothError.notConnected)
+                self.deviceModeReadContinuation = nil
+                self.deviceStateControlPointWriteErrorHandler = nil
                 self.currentPath = []
                 self.directoryEntries = []
                 self.isAwaitingDirectoryResponse = false
@@ -653,6 +660,7 @@ public extension FlySightCore {
                 case FlySightCore.DS_MODE_UUID:
                     dsModeCharacteristic = characteristic
                     peripheral.setNotifyValue(true, for: characteristic)
+                    peripheral.readValue(for: characteristic)
                 case FlySightCore.DS_CONTROL_POINT_UUID:
                     dsControlPointCharacteristic = characteristic
                     peripheral.setNotifyValue(true, for: characteristic)
@@ -795,11 +803,17 @@ public extension FlySightCore {
                 if let handler = notificationHandlers[characteristic.uuid] {
                     handler(peripheral, characteristic, error)
                 }
+                if characteristic.uuid == FlySightCore.DS_MODE_UUID {
+                    completeDeviceModeRead(result: .failure(error!))
+                }
                 return
             }
 
             guard let data = characteristic.value else {
                 print("No data in characteristic update for \(characteristic.uuid)")
+                if characteristic.uuid == FlySightCore.DS_MODE_UUID {
+                    completeDeviceModeRead(result: .failure(BluetoothError.invalidDeviceModeValue))
+                }
                 return
             }
 
@@ -857,6 +871,7 @@ public extension FlySightCore {
             } else if characteristic.uuid == FlySightCore.DS_CONTROL_POINT_UUID {
                 handledBySpecificLogic = true
             } else if characteristic.uuid == FlySightCore.DS_MODE_UUID {
+                handleDeviceModeValue(data)
                 handledBySpecificLogic = true
             }
 
@@ -865,6 +880,25 @@ public extension FlySightCore {
             } else if !handledBySpecificLogic {
                 // print("No specific logic or registered handler for characteristic \(characteristic.uuid). Data: \(data.hexEncodedString())")
             }
+        }
+
+        private func handleDeviceModeValue(_ data: Data) {
+            guard let rawMode = data.first else {
+                completeDeviceModeRead(result: .failure(BluetoothError.invalidDeviceModeValue))
+                return
+            }
+
+            let mode = FlySightCore.DeviceMode(rawValue: rawMode)
+            DispatchQueue.main.async {
+                self.deviceMode = mode
+                print("FlySight Device Mode: \(mode.displayName)")
+            }
+            completeDeviceModeRead(result: .success(mode))
+        }
+
+        private func completeDeviceModeRead(result: Result<FlySightCore.DeviceMode, Error>) {
+            deviceModeReadContinuation?.resume(with: result)
+            deviceModeReadContinuation = nil
         }
 
         public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
@@ -883,6 +917,9 @@ public extension FlySightCore {
                 }
                 if characteristic.uuid == FlySightCore.DS_CONTROL_POINT_UUID && isInstallingUploadedFirmware {
                     completeInstallUploadedFirmware(result: .failure(error))
+                }
+                if characteristic.uuid == FlySightCore.DS_CONTROL_POINT_UUID {
+                    deviceStateControlPointWriteErrorHandler?(error)
                 }
                 return
             }
@@ -1554,6 +1591,131 @@ public extension FlySightCore {
         }
 
         // MARK: - Firmware Update
+        public func readDeviceMode() async throws -> FlySightCore.DeviceMode {
+            let peripheral = try requireConnectedPeripheral()
+            let modeChar = try requireCharacteristic(
+                dsModeCharacteristic,
+                name: "DS_Mode",
+                uuid: FlySightCore.DS_MODE_UUID,
+                hint: "This FlySight firmware may not expose its device mode over BLE."
+            )
+
+            guard deviceModeReadContinuation == nil else {
+                throw FlySightCore.FirmwareUpdateBLEError.fileTransferOperationInProgress
+            }
+
+            return try await withCheckedThrowingContinuation { continuation in
+                deviceModeReadContinuation = continuation
+                peripheral.readValue(for: modeChar)
+            }
+        }
+
+        public func ensureIdleModeForFirmwareUpdate() async throws {
+            let currentMode = try await readDeviceMode()
+            guard currentMode.requiresIdleBeforeFirmwareUpdate else { return }
+
+            guard currentMode != .usb else {
+                throw BluetoothError.deviceModeCannotBeChanged(mode: currentMode.displayName)
+            }
+
+            try await performDeviceStateCommand(
+                FlySightCore.FirmwareUpdateBLECommands.requestSleepMode(),
+                expectedResponseTo: FlySightCore.DSControlOpcodes.requestSleep
+            )
+            try await waitForDeviceMode(.sleep)
+        }
+
+        private func waitForDeviceMode(_ targetMode: FlySightCore.DeviceMode) async throws {
+            for _ in 0..<20 {
+                if deviceMode == targetMode { return }
+
+                try await Task.sleep(nanoseconds: 250_000_000)
+
+                let mode = try await readDeviceMode()
+                if mode == targetMode { return }
+            }
+
+            throw BluetoothError.deviceModeChangeTimedOut(target: targetMode.displayName)
+        }
+
+        private func performDeviceStateCommand(_ command: Data, expectedResponseTo expectedOpcode: UInt8) async throws {
+            let peripheral = try requireConnectedPeripheral()
+            let controlChar = try requireCharacteristic(
+                dsControlPointCharacteristic,
+                name: "DS_Control_Point",
+                uuid: FlySightCore.DS_CONTROL_POINT_UUID,
+                hint: "This FlySight firmware may not support changing device mode over BLE. Put the FlySight into idle mode on the device, then try again."
+            )
+
+            guard notificationHandlers[controlChar.uuid] == nil, installUploadedFirmwareContinuation == nil else {
+                throw FlySightCore.FirmwareUpdateBLEError.fileTransferOperationInProgress
+            }
+
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                var didResume = false
+
+                deviceStateControlPointWriteErrorHandler = { [weak self] error in
+                    guard !didResume else { return }
+                    didResume = true
+                    self?.notificationHandlers[controlChar.uuid] = nil
+                    self?.deviceStateControlPointWriteErrorHandler = nil
+                    continuation.resume(throwing: error)
+                }
+
+                notificationHandlers[controlChar.uuid] = { [weak self] _, char, err in
+                    guard !didResume else { return }
+
+                    if let error = err {
+                        didResume = true
+                        self?.notificationHandlers[controlChar.uuid] = nil
+                        self?.deviceStateControlPointWriteErrorHandler = nil
+                        continuation.resume(throwing: error)
+                        return
+                    }
+
+                    guard let data = char.value else { return }
+                    guard data.count >= 3 else {
+                        didResume = true
+                        self?.notificationHandlers[controlChar.uuid] = nil
+                        self?.deviceStateControlPointWriteErrorHandler = nil
+                        continuation.resume(throwing: FlySightCore.FirmwareUpdateBLEError.controlPointResponseTooShort)
+                        return
+                    }
+
+                    let responseID = data[0]
+                    guard responseID == FlySightCore.CP_RESPONSE_ID else {
+                        didResume = true
+                        self?.notificationHandlers[controlChar.uuid] = nil
+                        self?.deviceStateControlPointWriteErrorHandler = nil
+                        continuation.resume(throwing: FlySightCore.FirmwareUpdateBLEError.unexpectedControlPointResponse(responseID: responseID))
+                        return
+                    }
+
+                    let responseOpcode = data[1]
+                    guard responseOpcode == expectedOpcode else {
+                        didResume = true
+                        self?.notificationHandlers[controlChar.uuid] = nil
+                        self?.deviceStateControlPointWriteErrorHandler = nil
+                        continuation.resume(throwing: FlySightCore.FirmwareUpdateBLEError.unexpectedControlPointOpcode(expected: expectedOpcode, actual: responseOpcode))
+                        return
+                    }
+
+                    didResume = true
+                    self?.notificationHandlers[controlChar.uuid] = nil
+                    self?.deviceStateControlPointWriteErrorHandler = nil
+
+                    let status = data[2]
+                    if status == FlySightCore.CP_STATUS.success {
+                        continuation.resume()
+                    } else {
+                        continuation.resume(throwing: FlySightCore.FirmwareUpdateBLEError.controlPointRejected(status: status))
+                    }
+                }
+
+                peripheral.writeValue(command, for: controlChar, type: .withResponse)
+            }
+        }
+
         public func installUploadedFirmware() async throws {
             let peripheral = try requireConnectedPeripheral()
             let controlChar = try requireCharacteristic(
@@ -1942,6 +2104,9 @@ public enum BluetoothError: Error, LocalizedError {
     case missingCharacteristic(name: String, uuid: String, hint: String)
     case deallocated
     case uploadFailed(String)
+    case invalidDeviceModeValue
+    case deviceModeCannotBeChanged(mode: String)
+    case deviceModeChangeTimedOut(target: String)
 
     public var errorDescription: String? {
         switch self {
@@ -1952,6 +2117,12 @@ public enum BluetoothError: Error, LocalizedError {
             return "Missing required Bluetooth characteristic \(name) (\(uuid)). \(hint)"
         case .deallocated: return "The Bluetooth manager was deallocated."
         case .uploadFailed(let reason): return "Upload failed: \(reason)"
+        case .invalidDeviceModeValue:
+            return "The FlySight reported an invalid device mode."
+        case .deviceModeCannotBeChanged(let mode):
+            return "FlySight is in \(mode) mode, which cannot be changed over BLE. Put the FlySight into idle mode on the device, then try again."
+        case .deviceModeChangeTimedOut(let target):
+            return "Timed out waiting for FlySight to enter \(target) mode."
         }
     }
 }

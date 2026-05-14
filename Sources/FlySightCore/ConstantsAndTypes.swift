@@ -69,5 +69,77 @@ public extension FlySightCore { // Also extends the FlySightCore enum namespace
     // Constants for Device State (DS) Control Point Opcodes
     struct DSControlOpcodes {
         public static let installUploadedFirmware: UInt8 = 0x04 // DS_CMD_INSTALL_UPLOADED_FIRMWARE
+        public static let requestSleep: UInt8 = 0x10 // DS_CMD_REQUEST_SLEEP
+    }
+
+    public enum DeviceMode: Equatable {
+        case sleep
+        case active
+        case config
+        case usb
+        case pairing
+        case start
+        case unknown(UInt8)
+
+        public init(rawValue: UInt8) {
+            switch rawValue {
+            case 0x00:
+                self = .sleep
+            case 0x01:
+                self = .active
+            case 0x02:
+                self = .config
+            case 0x03:
+                self = .usb
+            case 0x04:
+                self = .pairing
+            case 0x05:
+                self = .start
+            default:
+                self = .unknown(rawValue)
+            }
+        }
+
+        public var rawValue: UInt8 {
+            switch self {
+            case .sleep:
+                return 0x00
+            case .active:
+                return 0x01
+            case .config:
+                return 0x02
+            case .usb:
+                return 0x03
+            case .pairing:
+                return 0x04
+            case .start:
+                return 0x05
+            case .unknown(let rawValue):
+                return rawValue
+            }
+        }
+
+        public var displayName: String {
+            switch self {
+            case .sleep:
+                return "Idle"
+            case .active:
+                return "Active"
+            case .config:
+                return "Config"
+            case .usb:
+                return "USB"
+            case .pairing:
+                return "Pairing"
+            case .start:
+                return "Start"
+            case .unknown(let rawValue):
+                return "Unknown (0x\(String(format: "%02X", rawValue)))"
+            }
+        }
+
+        public var requiresIdleBeforeFirmwareUpdate: Bool {
+            self != .sleep
+        }
     }
 }

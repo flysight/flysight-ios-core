@@ -47,4 +47,12 @@ final class FirmwareUpdateBLECommandsTests: XCTestCase {
             Data([0x04])
         )
     }
+
+    func testRequestSleepModeCommand() {
+        XCTAssertEqual(FlySightCore.DSControlOpcodes.requestSleep, 0x10)
+        XCTAssertEqual(
+            FlySightCore.FirmwareUpdateBLECommands.requestSleepMode(),
+            Data([0x10])
+        )
+    }
 }

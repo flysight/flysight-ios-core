@@ -39,6 +39,10 @@ public extension FlySightCore {
             Data([DSControlOpcodes.installUploadedFirmware])
         }
 
+        public static func requestSleepMode() -> Data {
+            Data([DSControlOpcodes.requestSleep])
+        }
+
         static func readFile(
             path: String,
             offsetMultiplier: UInt32 = 0,
