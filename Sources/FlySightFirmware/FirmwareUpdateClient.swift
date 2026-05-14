@@ -192,6 +192,12 @@ public struct FirmwareEndpointError: Decodable, Error, Equatable {
         KnownCode(rawValue: code)
     }
 
+    public init(code: String, message: String, status: Int?) {
+        self.code = code
+        self.message = message
+        self.status = status
+    }
+
     private enum CodingKeys: String, CodingKey {
         case code
         case message

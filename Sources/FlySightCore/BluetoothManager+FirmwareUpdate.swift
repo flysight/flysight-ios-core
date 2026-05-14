@@ -1,0 +1,15 @@
+//
+//  BluetoothManager+FirmwareUpdate.swift
+//  FlySightCore
+//
+//  Created by Codex on 2026-05-14.
+//
+
+import Foundation
+import FlySightFirmware
+
+extension FlySightCore.BluetoothManager: FirmwareUpdateBLETransport {
+    public func uploadFirmwareUpdateFile(_ data: Data, targetPath: String) async throws {
+        try await uploadFile(fileData: data, remotePath: targetPath)
+    }
+}

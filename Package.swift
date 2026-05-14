@@ -21,7 +21,7 @@ let package = Package(
     targets: [
         .target(
             name: "FlySightCore",
-            dependencies: []),
+            dependencies: ["FlySightFirmware"]),
         .target(
             name: "FlySightFirmware",
             dependencies: []),
