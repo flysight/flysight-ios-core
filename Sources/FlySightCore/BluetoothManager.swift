@@ -99,6 +99,7 @@ public extension FlySightCore {
         private var installUploadedFirmwareContinuation: CheckedContinuation<Void, Error>?
         private var deviceModeReadContinuation: CheckedContinuation<FlySightCore.DeviceMode, Error>?
         private var deviceStateControlPointWriteErrorHandler: ((Error) -> Void)?
+        private var isSendingUploadWindow = false
         private var isInstallingUploadedFirmware = false
 
         private var pingTimer: Timer?
@@ -203,6 +204,7 @@ public extension FlySightCore {
                     self.uploadContinuation?.resume(throwing: NSError(domain: "FlySightCore.Upload", code: -100, userInfo: [NSLocalizedDescriptionKey: "Connection lost during upload."]))
                     self.uploadContinuation = nil
                     self.isUploading = false
+                    self.isSendingUploadWindow = false
                     self.uploadProgress = 0.0
                 }
                 if self.isInstallingUploadedFirmware {
@@ -1224,6 +1226,12 @@ public extension FlySightCore {
                     return
                 }
                 guard let data = char.value, data.count >= 2, data[0] == 0x10 else {
+                    if let data = char.value,
+                       data.count >= 2,
+                       data[0] == FlySightCore.FTResponseOpcodes.nak,
+                       data[1] == FlySightCore.FTControlOpcodes.readFile {
+                        transferCompleteSubject.send(completion: .failure(FlySightCore.FirmwareUpdateBLEError.fileTransferCommandRejected(opcode: data[1])))
+                    }
                     return
                 }
 
@@ -1404,7 +1412,8 @@ public extension FlySightCore {
                 self.nextPacketNum = 0
                 self.nextAckNum = 0
                 self.lastPacketNum = nil
-                self.totalPacketsToSend = UInt32(ceil(Double(fileData.count) / Double(self.frameLength)))
+                self.isSendingUploadWindow = false
+                self.totalPacketsToSend = UInt32((fileData.count + self.frameLength - 1) / self.frameLength)
                 if fileData.isEmpty { self.totalPacketsToSend = 1 }
                 self.uploadTask?.cancel()
                 self.uploadTask = nil
@@ -1437,12 +1446,7 @@ public extension FlySightCore {
                         self.handleUploadCompletion(result: .failure(NSError(domain: "FlySightCore.Upload", code: Int(data[1]), userInfo: [NSLocalizedDescriptionKey: "Failed to open remote file for writing (NAK)."])))
 
                     case FlySightCore.FTResponseOpcodes.nak where data[1] == FlySightCore.FTControlOpcodes.fileData:
-                        if self.lastPacketNum != nil {
-                            print("Upload: File data NAK received after EOF packet was sent. Treating upload as complete.")
-                            self.handleUploadCompletion(result: .success(()))
-                        } else {
-                            self.handleUploadCompletion(result: .failure(NSError(domain: "FlySightCore.Upload", code: Int(data[1]), userInfo: [NSLocalizedDescriptionKey: "FlySight rejected file data before the upload completed."])))
-                        }
+                        self.handleUploadCompletion(result: .failure(NSError(domain: "FlySightCore.Upload", code: Int(data[1]), userInfo: [NSLocalizedDescriptionKey: "FlySight rejected file data during upload. The uploaded file may be incomplete."])))
 
                     case FlySightCore.FTControlOpcodes.ackFileData:
                         let ackedPacketNum = Int(data[1])
@@ -1496,26 +1500,36 @@ public extension FlySightCore {
 
         private func sendUploadDataPackets(peripheral: CBPeripheral, rxChar: CBCharacteristic) async {
             guard isUploading, let dataToSend = fileDataToUpload else { return }
+            guard !isSendingUploadWindow else { return }
+
+            isSendingUploadWindow = true
+            defer { isSendingUploadWindow = false }
+
+            let dataPacketCount = (dataToSend.count + frameLength - 1) / frameLength
 
             while nextPacketNum < (nextAckNum + windowLength) {
                 if let lastSentPacket = lastPacketNum, nextPacketNum >= lastSentPacket {
                     break
                 }
 
-                let isFinalPacket = (nextPacketNum * frameLength) >= dataToSend.count
+                let isFinalPacket = nextPacketNum == dataPacketCount
 
                 let packetData: Data
                 var dataChunk = Data()
 
-                if !isFinalPacket {
+                if nextPacketNum < dataPacketCount {
                     let startIndex = nextPacketNum * frameLength
                     let endIndex = min(startIndex + frameLength, dataToSend.count)
                     dataChunk = dataToSend.subdata(in: startIndex..<endIndex)
                     packetData = Data([0x10, UInt8(nextPacketNum % 256)]) + dataChunk
-                } else {
+                } else if isFinalPacket {
+                    guard nextAckNum >= dataPacketCount else { break }
+
                     packetData = Data([0x10, UInt8(nextPacketNum % 256)])
                     print("Upload: Preparing final empty packet #\(nextPacketNum % 256)")
                     lastPacketNum = nextPacketNum + 1
+                } else {
+                    break
                 }
 
                 peripheral.writeValue(packetData, for: rxChar, type: .withoutResponse)
@@ -1565,6 +1579,7 @@ public extension FlySightCore {
                 notificationHandlers[txChar.uuid] = nil
             }
             isUploading = false
+            isSendingUploadWindow = false
             fileDataToUpload = nil
             remotePathToUpload = nil
 

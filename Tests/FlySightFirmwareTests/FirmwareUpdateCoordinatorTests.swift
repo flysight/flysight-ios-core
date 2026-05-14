@@ -30,6 +30,7 @@ final class FirmwareUpdateCoordinatorTests: XCTestCase {
             .readStateFile,
             .ensureFirmwareDirectory,
             .upload(targetPath: "FW/APP.SFB", data: Self.appData),
+            .read(targetPath: "FW/APP.SFB", knownSize: Self.appData.count),
             .installUploadedFirmware
         ])
         XCTAssertEqual(states, [
@@ -39,6 +40,7 @@ final class FirmwareUpdateCoordinatorTests: XCTestCase {
             .downloadingFirmware(recommended.firmware),
             .creatingFirmwareDirectory,
             .uploadingFirmware(recommended.firmware),
+            .verifyingFirmware(recommended.firmware),
             .requestingInstall,
             .completed(result)
         ])
@@ -67,7 +69,9 @@ final class FirmwareUpdateCoordinatorTests: XCTestCase {
             .readStateFile,
             .ensureFirmwareDirectory,
             .upload(targetPath: "FW/STACK.BIN", data: Self.stackData),
+            .read(targetPath: "FW/STACK.BIN", knownSize: Self.stackData.count),
             .upload(targetPath: "FW/APP.SFB", data: Self.appData),
+            .read(targetPath: "FW/APP.SFB", knownSize: Self.appData.count),
             .installUploadedFirmware
         ])
     }
@@ -94,7 +98,12 @@ final class FirmwareUpdateCoordinatorTests: XCTestCase {
 
     func testSelectedVersionUsesChosenFirmware() async throws {
         let recommended = Self.option(version: "v2024.12.30.8", appFileName: "recommended.sfb", stackRequired: false)
-        let selected = Self.option(version: "v2026.03.06.develop", appFileName: "selected.sfb", stackRequired: false)
+        let selected = Self.option(
+            version: "v2026.03.06.develop",
+            appFileName: "selected.sfb",
+            firmwareData: Self.selectedAppData,
+            stackRequired: false
+        )
         let manifest = Self.manifest(recommended: recommended, firmwares: [recommended, selected])
         let client = FakeFirmwareClient(manifest: manifest, downloads: [
             selected.firmware.url: .success(Self.selectedAppData)
@@ -191,6 +200,33 @@ final class FirmwareUpdateCoordinatorTests: XCTestCase {
         assertFailed(coordinator.state)
     }
 
+    func testUploadVerificationFailureStopsBeforeInstall() async throws {
+        let option = Self.option(version: "v2024.12.30.8", stackRequired: false)
+        let client = FakeFirmwareClient(manifest: Self.manifest(recommended: option, firmwares: [option]), downloads: [
+            option.firmware.url: .success(Self.appData)
+        ])
+        let ble = FakeFirmwareUpdateBLETransport()
+        ble.readbackOverrides["FW/APP.SFB"] = Data("bad".utf8)
+        let coordinator = FirmwareUpdateCoordinator(client: client, bleTransport: ble)
+
+        do {
+            _ = try await coordinator.performUpdate()
+            XCTFail("Expected upload verification error")
+        } catch FirmwareUpdateCoordinatorError.uploadedFileSHA256Mismatch(let targetPath, _, _) {
+            XCTAssertEqual(targetPath, "FW/APP.SFB")
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertEqual(ble.calls, [
+            .readStateFile,
+            .ensureFirmwareDirectory,
+            .upload(targetPath: "FW/APP.SFB", data: Self.appData),
+            .read(targetPath: "FW/APP.SFB", knownSize: Self.appData.count)
+        ])
+        assertFailed(coordinator.state)
+    }
+
     func testInstallFailureSurfacesAfterUpload() async throws {
         let option = Self.option(version: "v2024.12.30.8", stackRequired: false)
         let client = FakeFirmwareClient(manifest: Self.manifest(recommended: option, firmwares: [option]), downloads: [
@@ -213,6 +249,7 @@ final class FirmwareUpdateCoordinatorTests: XCTestCase {
             .readStateFile,
             .ensureFirmwareDirectory,
             .upload(targetPath: "FW/APP.SFB", data: Self.appData),
+            .read(targetPath: "FW/APP.SFB", knownSize: Self.appData.count),
             .installUploadedFirmware
         ])
         assertFailed(coordinator.state)
@@ -241,13 +278,14 @@ final class FirmwareUpdateCoordinatorTests: XCTestCase {
     private static func option(
         version: String,
         appFileName: String = "app.sfb",
+        firmwareData: Data = appData,
         stackRequired: Bool
     ) -> FirmwareOption {
         let stackFile = FirmwareFile(
             url: URL(string: "https://example.com/\(version)/stack.bin")!,
             targetPath: "FW/STACK.BIN",
             sizeBytes: stackData.count,
-            sha256: String(repeating: "1", count: 64)
+            sha256: FirmwareUpdateClient.sha256Hex(for: stackData)
         )
 
         return FirmwareOption(
@@ -258,8 +296,8 @@ final class FirmwareUpdateCoordinatorTests: XCTestCase {
             firmware: FirmwareFile(
                 url: URL(string: "https://example.com/\(version)/\(appFileName)")!,
                 targetPath: "FW/APP.SFB",
-                sizeBytes: appData.count,
-                sha256: String(repeating: "0", count: 64)
+                sizeBytes: firmwareData.count,
+                sha256: FirmwareUpdateClient.sha256Hex(for: firmwareData)
             ),
             stack: StackUpdate(
                 requiredVersion: "1.19.0",
@@ -324,6 +362,7 @@ private final class FakeFirmwareUpdateBLETransport: FirmwareUpdateBLETransport {
         case readStateFile
         case ensureFirmwareDirectory
         case upload(targetPath: String, data: Data)
+        case read(targetPath: String, knownSize: Int)
         case installUploadedFirmware
     }
 
@@ -331,9 +370,12 @@ private final class FakeFirmwareUpdateBLETransport: FirmwareUpdateBLETransport {
     var readError: Error?
     var ensureDirectoryError: Error?
     var uploadError: Error?
+    var readbackError: Error?
     var installError: Error?
+    var readbackOverrides: [String: Data] = [:]
 
     private(set) var calls: [Call] = []
+    private var uploadedFiles: [String: Data] = [:]
 
     func readFlysightStateFile() async throws -> String {
         calls.append(.readStateFile)
@@ -355,6 +397,21 @@ private final class FakeFirmwareUpdateBLETransport: FirmwareUpdateBLETransport {
         if let uploadError = uploadError {
             throw uploadError
         }
+        uploadedFiles[targetPath] = data
+    }
+
+    func readFirmwareUpdateFile(targetPath: String, knownSize: Int) async throws -> Data {
+        calls.append(.read(targetPath: targetPath, knownSize: knownSize))
+        if let readbackError = readbackError {
+            throw readbackError
+        }
+        if let data = readbackOverrides[targetPath] {
+            return data
+        }
+        guard let data = uploadedFiles[targetPath] else {
+            throw TestError.missingUpload
+        }
+        return data
     }
 
     func installUploadedFirmware() async throws {
@@ -367,6 +424,7 @@ private final class FakeFirmwareUpdateBLETransport: FirmwareUpdateBLETransport {
 
 private enum TestError: Error, Equatable {
     case missingDownload
+    case missingUpload
     case uploadFailed
     case installFailed
 }

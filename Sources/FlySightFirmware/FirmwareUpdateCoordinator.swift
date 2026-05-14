@@ -11,6 +11,7 @@ public protocol FirmwareUpdateBLETransport {
     func readFlysightStateFile() async throws -> String
     func ensureFirmwareUpdateDirectory() async throws
     func uploadFirmwareUpdateFile(_ data: Data, targetPath: String) async throws
+    func readFirmwareUpdateFile(targetPath: String, knownSize: Int) async throws -> Data
     func installUploadedFirmware() async throws
 }
 
@@ -40,6 +41,8 @@ public enum FirmwareUpdateCoordinatorError: Error, Equatable {
     case noManifestLoaded
     case firmwareOptionUnavailable(version: String)
     case stackUpdateRequiredButMissingFile(version: String)
+    case uploadedFileSizeMismatch(targetPath: String, expected: Int, actual: Int)
+    case uploadedFileSHA256Mismatch(targetPath: String, expected: String, actual: String)
 }
 
 extension FirmwareUpdateCoordinatorError: LocalizedError {
@@ -51,6 +54,10 @@ extension FirmwareUpdateCoordinatorError: LocalizedError {
             return "Firmware version \(version) is not available for this FlySight."
         case .stackUpdateRequiredButMissingFile(let version):
             return "Firmware version \(version) requires a stack update, but no stack file was provided."
+        case .uploadedFileSizeMismatch(let targetPath, let expected, let actual):
+            return "Uploaded file \(targetPath) could not be verified. Expected \(expected) bytes, read back \(actual) bytes."
+        case .uploadedFileSHA256Mismatch(let targetPath, let expected, let actual):
+            return "Uploaded file \(targetPath) could not be verified. Expected SHA-256 \(expected), read back \(actual)."
         }
     }
 }
@@ -65,6 +72,8 @@ public enum FirmwareUpdateState: Equatable {
     case creatingFirmwareDirectory
     case uploadingStack(FirmwareFile)
     case uploadingFirmware(FirmwareFile)
+    case verifyingStack(FirmwareFile)
+    case verifyingFirmware(FirmwareFile)
     case requestingInstall
     case completed(FirmwareUpdateResult)
     case failed(message: String)
@@ -185,6 +194,8 @@ public final class FirmwareUpdateCoordinator {
                     stackData,
                     targetPath: stackFile.targetPath
                 )
+                setState(.verifyingStack(stackFile))
+                try await verifyUploadedFile(stackFile)
             }
 
             setState(.uploadingFirmware(option.firmware))
@@ -192,6 +203,8 @@ public final class FirmwareUpdateCoordinator {
                 firmwareData,
                 targetPath: option.firmware.targetPath
             )
+            setState(.verifyingFirmware(option.firmware))
+            try await verifyUploadedFile(option.firmware)
 
             setState(.requestingInstall)
             try await bleTransport.installUploadedFirmware()
@@ -221,6 +234,30 @@ public final class FirmwareUpdateCoordinator {
         }
 
         return file
+    }
+
+    private func verifyUploadedFile(_ file: FirmwareFile) async throws {
+        let data = try await bleTransport.readFirmwareUpdateFile(
+            targetPath: file.targetPath,
+            knownSize: file.sizeBytes
+        )
+
+        guard data.count == file.sizeBytes else {
+            throw FirmwareUpdateCoordinatorError.uploadedFileSizeMismatch(
+                targetPath: file.targetPath,
+                expected: file.sizeBytes,
+                actual: data.count
+            )
+        }
+
+        let actualSHA256 = FirmwareUpdateClient.sha256Hex(for: data)
+        guard actualSHA256 == file.sha256.lowercased() else {
+            throw FirmwareUpdateCoordinatorError.uploadedFileSHA256Mismatch(
+                targetPath: file.targetPath,
+                expected: file.sha256.lowercased(),
+                actual: actualSHA256
+            )
+        }
     }
 
     private func setState(_ state: FirmwareUpdateState) {
