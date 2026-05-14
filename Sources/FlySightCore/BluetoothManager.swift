@@ -93,6 +93,7 @@ public extension FlySightCore {
         private let frameLength: Int = 242
         private let txTimeoutInterval: TimeInterval = 0.2
         private var totalPacketsToSend: UInt32 = 0
+        private var uploadTask: Task<Void, Never>?
         private var uploadContinuation: CheckedContinuation<Void, Error>?
         private var installUploadedFirmwareContinuation: CheckedContinuation<Void, Error>?
         private var isInstallingUploadedFirmware = false
@@ -181,6 +182,7 @@ public extension FlySightCore {
                 self.flysightFirmwareVersion = nil
 
                 self.stopPingTimer()
+                self.notificationHandlers.removeAll()
                 self.currentPath = []
                 self.directoryEntries = []
                 self.isAwaitingDirectoryResponse = false
@@ -189,6 +191,8 @@ public extension FlySightCore {
                 self.gnssMaskUpdateStatus = .idle
 
                 if self.isUploading {
+                    self.uploadTask?.cancel()
+                    self.uploadTask = nil
                     self.uploadContinuation?.resume(throwing: NSError(domain: "FlySightCore.Upload", code: -100, userInfo: [NSLocalizedDescriptionKey: "Connection lost during upload."]))
                     self.uploadContinuation = nil
                     self.isUploading = false
@@ -823,9 +827,7 @@ public extension FlySightCore {
                     print("Received NAK for command 0x\(String(format: "%02X", originalCommand))")
                     DispatchQueue.main.async { self.isAwaitingDirectoryResponse = false }
                      if originalCommand == 0x03 {
-                        self.uploadContinuation?.resume(throwing: NSError(domain: "FlySightCore.Upload", code: Int(originalCommand), userInfo: [NSLocalizedDescriptionKey: "Failed to open remote file for writing (NAK)."]))
-                        self.uploadContinuation = nil
-                        self.isUploading = false
+                        self.handleUploadCompletion(result: .failure(NSError(domain: "FlySightCore.Upload", code: Int(originalCommand), userInfo: [NSLocalizedDescriptionKey: "Failed to open remote file for writing (NAK)."])))
                     }
                     handledBySpecificLogic = true
                 case 0xF1:
@@ -1322,6 +1324,10 @@ public extension FlySightCore {
                 throw BluetoothError.notConnectedOrCharsMissing
             }
 
+            guard !isUploading, uploadContinuation == nil, notificationHandlers[txChar.uuid] == nil else {
+                throw FlySightCore.FirmwareUpdateBLEError.fileTransferOperationInProgress
+            }
+
             return try await withCheckedThrowingContinuation { [weak self] continuation in
                 guard let self = self else {
                     continuation.resume(throwing: BluetoothError.deallocated)
@@ -1336,6 +1342,8 @@ public extension FlySightCore {
                 self.lastPacketNum = nil
                 self.totalPacketsToSend = UInt32(ceil(Double(fileData.count) / Double(self.frameLength)))
                 if fileData.isEmpty { self.totalPacketsToSend = 1 }
+                self.uploadTask?.cancel()
+                self.uploadTask = nil
 
                 self.uploadContinuation = continuation
 
@@ -1350,26 +1358,50 @@ public extension FlySightCore {
                         self.handleUploadCompletion(result: .failure(error))
                         return
                     }
-                    guard let data = char.value, data.count == 2, data[0] == 0x12 else {
+                    guard let data = char.value, data.count >= 2 else {
                         return
                     }
 
-                    let ackedPacketNum = Int(data[1])
-
-                    if ackedPacketNum == (self.nextAckNum % 256) {
-                        self.nextAckNum += 1
-                        DispatchQueue.main.async {
-                            if self.totalPacketsToSend > 0 {
-                                self.uploadProgress = Float(self.nextAckNum) / Float(self.totalPacketsToSend)
-                            }
+                    switch data[0] {
+                    case FlySightCore.FTResponseOpcodes.ack where data[1] == FlySightCore.FTControlOpcodes.writeFileOpen:
+                        print("Upload: OpenFile ACK received for \(remotePath). Starting data transfer.")
+                        if self.uploadTask == nil {
+                            self.startUploadTask(peripheral: p, rxChar: rxChar)
                         }
-                        if let lastSent = self.lastPacketNum, self.nextAckNum >= lastSent {
+
+                    case FlySightCore.FTResponseOpcodes.nak where data[1] == FlySightCore.FTControlOpcodes.writeFileOpen:
+                        self.handleUploadCompletion(result: .failure(NSError(domain: "FlySightCore.Upload", code: Int(data[1]), userInfo: [NSLocalizedDescriptionKey: "Failed to open remote file for writing (NAK)."])))
+
+                    case FlySightCore.FTResponseOpcodes.nak where data[1] == FlySightCore.FTControlOpcodes.fileData:
+                        if self.lastPacketNum != nil {
+                            print("Upload: File data NAK received after EOF packet was sent. Treating upload as complete.")
                             self.handleUploadCompletion(result: .success(()))
                         } else {
-                            Task { await self.sendUploadDataPackets(peripheral: p, rxChar: rxChar) }
+                            self.handleUploadCompletion(result: .failure(NSError(domain: "FlySightCore.Upload", code: Int(data[1]), userInfo: [NSLocalizedDescriptionKey: "FlySight rejected file data before the upload completed."])))
                         }
-                    } else {
-                        print("Upload: Received ACK for \(ackedPacketNum), expected for \(self.nextAckNum % 256).")
+
+                    case FlySightCore.FTControlOpcodes.ackFileData:
+                        let ackedPacketNum = Int(data[1])
+
+                        if ackedPacketNum == (self.nextAckNum % 256) {
+                            self.nextAckNum += 1
+                            DispatchQueue.main.async {
+                                if self.totalPacketsToSend > 0 {
+                                    let acknowledgedDataPackets = min(UInt32(self.nextAckNum), self.totalPacketsToSend)
+                                    self.uploadProgress = Float(acknowledgedDataPackets) / Float(self.totalPacketsToSend)
+                                }
+                            }
+                            if let lastSent = self.lastPacketNum, self.nextAckNum >= lastSent {
+                                self.handleUploadCompletion(result: .success(()))
+                            } else {
+                                Task { await self.sendUploadDataPackets(peripheral: p, rxChar: rxChar) }
+                            }
+                        } else {
+                            print("Upload: Received ACK for \(ackedPacketNum), expected for \(self.nextAckNum % 256).")
+                        }
+
+                    default:
+                        break
                     }
                 }
 
@@ -1379,13 +1411,6 @@ public extension FlySightCore {
 
                 peripheral.writeValue(openCommand, for: rxChar, type: .withoutResponse)
                 print("Upload: Sent OpenFile command for \(remotePath).")
-
-                Task {
-                    try? await Task.sleep(nanoseconds: 200_000_000)
-                    if self.isUploading {
-                        await self.sendUploadDataPackets(peripheral: peripheral, rxChar: rxChar)
-                    }
-                }
             }
         }
 
@@ -1438,17 +1463,53 @@ public extension FlySightCore {
             }
         }
 
-        private func handleUploadCompletion(result: Result<Void, Error>) {
-            DispatchQueue.main.async {
-                self.uploadContinuation?.resume(with: result)
-                self.uploadContinuation = nil
-                self.isUploading = false
-                self.fileDataToUpload = nil
-                self.remotePathToUpload = nil
-                self.uploadProgress = (try? result.get()) != nil ? 1.0 : 0.0
+        private func startUploadTask(peripheral: CBPeripheral, rxChar: CBCharacteristic) {
+            uploadTask?.cancel()
+            uploadTask = Task { [weak self] in
+                guard let self = self else { return }
 
+                await self.sendUploadDataPackets(peripheral: peripheral, rxChar: rxChar)
+                var lastObservedAck = self.nextAckNum
+
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: UInt64(self.txTimeoutInterval * 1_000_000_000))
+
+                    guard self.isUploading else { return }
+                    if let lastSentPacket = self.lastPacketNum, self.nextAckNum >= lastSentPacket {
+                        return
+                    }
+
+                    if self.nextAckNum == lastObservedAck && self.nextPacketNum > self.nextAckNum {
+                        print("Upload: ACK timeout. Resending window starting at packet \(self.nextAckNum).")
+                        self.nextPacketNum = self.nextAckNum
+                    } else {
+                        lastObservedAck = self.nextAckNum
+                    }
+
+                    await self.sendUploadDataPackets(peripheral: peripheral, rxChar: rxChar)
+                }
+            }
+        }
+
+        private func handleUploadCompletion(result: Result<Void, Error>) {
+            guard let continuation = uploadContinuation else { return }
+
+            uploadContinuation = nil
+            uploadTask?.cancel()
+            uploadTask = nil
+            if let txChar = ftPacketOutCharacteristic {
+                notificationHandlers[txChar.uuid] = nil
+            }
+            isUploading = false
+            fileDataToUpload = nil
+            remotePathToUpload = nil
+
+            let finalProgress: Float = (try? result.get()) != nil ? 1.0 : 0.0
+            DispatchQueue.main.async {
+                self.uploadProgress = finalProgress
                 print("Upload completed with result: \(result)")
             }
+            continuation.resume(with: result)
         }
 
         public func cancelUpload() {
@@ -1461,16 +1522,8 @@ public extension FlySightCore {
                 print("Sent Cancel Transfer (0xFF) command to FlySight.")
             }
 
-            DispatchQueue.main.async {
-                let error = NSError(domain: "FlySightCore.Upload", code: -999, userInfo: [NSLocalizedDescriptionKey: "Upload cancelled by user."])
-                self.uploadContinuation?.resume(throwing: error)
-                self.uploadContinuation = nil
-
-                self.isUploading = false
-                self.fileDataToUpload = nil
-                self.remotePathToUpload = nil
-                self.uploadProgress = 0.0
-            }
+            let error = NSError(domain: "FlySightCore.Upload", code: -999, userInfo: [NSLocalizedDescriptionKey: "Upload cancelled by user."])
+            handleUploadCompletion(result: .failure(error))
         }
 
         // MARK: - Firmware Update
