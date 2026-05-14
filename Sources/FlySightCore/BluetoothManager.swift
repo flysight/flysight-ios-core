@@ -94,6 +94,8 @@ public extension FlySightCore {
         private let txTimeoutInterval: TimeInterval = 0.2
         private var totalPacketsToSend: UInt32 = 0
         private var uploadContinuation: CheckedContinuation<Void, Error>?
+        private var installUploadedFirmwareContinuation: CheckedContinuation<Void, Error>?
+        private var isInstallingUploadedFirmware = false
 
         private var pingTimer: Timer?
 
@@ -191,6 +193,9 @@ public extension FlySightCore {
                     self.uploadContinuation = nil
                     self.isUploading = false
                     self.uploadProgress = 0.0
+                }
+                if self.isInstallingUploadedFirmware {
+                    self.completeInstallUploadedFirmware(result: .success(()))
                 }
                 self.downloadProgress = 0.0
             }
@@ -847,6 +852,8 @@ public extension FlySightCore {
             } else if characteristic.uuid == FlySightCore.SP_CONTROL_POINT_UUID {
                 processSPControlPointResponse(from: data)
                 handledBySpecificLogic = true
+            } else if characteristic.uuid == FlySightCore.DS_CONTROL_POINT_UUID {
+                handledBySpecificLogic = true
             } else if characteristic.uuid == FlySightCore.DS_MODE_UUID {
                 handledBySpecificLogic = true
             }
@@ -871,6 +878,9 @@ public extension FlySightCore {
                         self.lastAttemptedGNSSMask = nil
                         if self.connectedPeripheralInfo != nil && self.sdControlPointCharacteristic != nil { self.fetchGNSSMask() }
                     }
+                }
+                if characteristic.uuid == FlySightCore.DS_CONTROL_POINT_UUID && isInstallingUploadedFirmware {
+                    completeInstallUploadedFirmware(result: .failure(error))
                 }
                 return
             }
@@ -1132,6 +1142,11 @@ public extension FlySightCore {
 
         // MARK: - Download and Upload (GBN ARQ)
         public func downloadFile(named filePath: String, knownSize: UInt32, completion: @escaping (Result<Data, Error>) -> Void) {
+            let fullPath = (currentPath + [filePath]).joined(separator: "/")
+            downloadFile(at: fullPath, knownSize: knownSize, completion: completion)
+        }
+
+        public func downloadFile(at remotePath: String, knownSize: UInt32, completion: @escaping (Result<Data, Error>) -> Void) {
             guard let peripheral = connectedPeripheralInfo?.peripheral,
                   let rxChar = ftPacketInCharacteristic,
                   let txChar = ftPacketOutCharacteristic
@@ -1187,13 +1202,8 @@ public extension FlySightCore {
                 }
             }
 
-            let fullPath = (currentPath + [filePath]).joined(separator: "/")
-            print("Requesting download for: \(fullPath)")
-            var command = Data([0x02])
-            command.append(UInt32(0).littleEndianData)
-            command.append(UInt32(0).littleEndianData)
-            command.append(fullPath.data(using: .utf8) ?? Data())
-            command.append(0x00)
+            print("Requesting download for: \(remotePath)")
+            let command = FlySightCore.FirmwareUpdateBLECommands.readFile(path: remotePath)
 
             peripheral.writeValue(command, for: rxChar, type: .withoutResponse)
 
@@ -1208,6 +1218,22 @@ public extension FlySightCore {
             cancellable.store(in: &cancellables)
         }
 
+        public func downloadFile(at remotePath: String, knownSize: UInt32 = 0) async throws -> Data {
+            try await withCheckedThrowingContinuation { continuation in
+                downloadFile(at: remotePath, knownSize: knownSize) { result in
+                    continuation.resume(with: result)
+                }
+            }
+        }
+
+        public func readFlysightStateFile() async throws -> String {
+            let data = try await downloadFile(at: FlySightCore.FirmwareUpdateBLEPath.flysightStateFile, knownSize: 0)
+            guard let text = String(data: data, encoding: .utf8) else {
+                throw FlySightCore.FirmwareUpdateBLEError.invalidStateFileEncoding
+            }
+            return text
+        }
+
         public func cancelDownload() {
             guard let peripheral = connectedPeripheralInfo?.peripheral, let char = ftPacketInCharacteristic else { return }
             let cancelCommand = Data([0xFF])
@@ -1216,6 +1242,75 @@ public extension FlySightCore {
                 self.downloadProgress = 0.0
             }
             print("Sent Cancel Transfer command.")
+        }
+
+        private func performFileTransferCommand(_ command: Data, expectedResponseTo expectedOpcode: UInt8, tolerateNAK: Bool = false) async throws {
+            guard let peripheral = connectedPeripheralInfo?.peripheral,
+                  let rxChar = ftPacketInCharacteristic,
+                  let txChar = ftPacketOutCharacteristic
+            else {
+                throw BluetoothError.notConnectedOrCharsMissing
+            }
+
+            guard notificationHandlers[txChar.uuid] == nil else {
+                throw FlySightCore.FirmwareUpdateBLEError.fileTransferOperationInProgress
+            }
+
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                var didResume = false
+
+                notificationHandlers[txChar.uuid] = { [weak self] _, char, err in
+                    guard !didResume else { return }
+
+                    if let error = err {
+                        didResume = true
+                        self?.notificationHandlers[txChar.uuid] = nil
+                        continuation.resume(throwing: error)
+                        return
+                    }
+
+                    guard let data = char.value else { return }
+                    guard data.count >= 2 else {
+                        didResume = true
+                        self?.notificationHandlers[txChar.uuid] = nil
+                        continuation.resume(throwing: FlySightCore.FirmwareUpdateBLEError.fileTransferResponseTooShort)
+                        return
+                    }
+
+                    let responseOpcode = data[0]
+                    let originalOpcode = data[1]
+
+                    guard responseOpcode == FlySightCore.FTResponseOpcodes.ack || responseOpcode == FlySightCore.FTResponseOpcodes.nak else {
+                        return
+                    }
+
+                    guard originalOpcode == expectedOpcode else {
+                        didResume = true
+                        self?.notificationHandlers[txChar.uuid] = nil
+                        continuation.resume(throwing: FlySightCore.FirmwareUpdateBLEError.unexpectedFileTransferOpcode(expected: expectedOpcode, actual: originalOpcode))
+                        return
+                    }
+
+                    didResume = true
+                    self?.notificationHandlers[txChar.uuid] = nil
+
+                    if responseOpcode == FlySightCore.FTResponseOpcodes.ack || tolerateNAK {
+                        continuation.resume()
+                    } else {
+                        continuation.resume(throwing: FlySightCore.FirmwareUpdateBLEError.fileTransferCommandRejected(opcode: originalOpcode))
+                    }
+                }
+
+                peripheral.writeValue(command, for: rxChar, type: .withoutResponse)
+            }
+        }
+
+        public func ensureFirmwareUpdateDirectory() async throws {
+            try await performFileTransferCommand(
+                FlySightCore.FirmwareUpdateBLECommands.createFirmwareDirectory(),
+                expectedResponseTo: FlySightCore.FTControlOpcodes.createDirectory,
+                tolerateNAK: true
+            )
         }
 
 
@@ -1294,6 +1389,22 @@ public extension FlySightCore {
             }
         }
 
+        public func uploadFirmwareUpdateApplication(_ data: Data) async throws {
+            try await uploadFile(fileData: data, remotePath: FlySightCore.FirmwareUpdateBLEPath.applicationImage)
+        }
+
+        public func uploadFirmwareUpdateStack(_ data: Data) async throws {
+            try await uploadFile(fileData: data, remotePath: FlySightCore.FirmwareUpdateBLEPath.stackImage)
+        }
+
+        public func uploadFirmwareUpdateFiles(application: Data, stack: Data?) async throws {
+            try await ensureFirmwareUpdateDirectory()
+            if let stack = stack {
+                try await uploadFirmwareUpdateStack(stack)
+            }
+            try await uploadFirmwareUpdateApplication(application)
+        }
+
         private func sendUploadDataPackets(peripheral: CBPeripheral, rxChar: CBCharacteristic) async {
             guard isUploading, let dataToSend = fileDataToUpload else { return }
 
@@ -1359,6 +1470,79 @@ public extension FlySightCore {
                 self.fileDataToUpload = nil
                 self.remotePathToUpload = nil
                 self.uploadProgress = 0.0
+            }
+        }
+
+        // MARK: - Firmware Update
+        public func installUploadedFirmware() async throws {
+            guard let peripheral = connectedPeripheralInfo?.peripheral,
+                  let controlChar = dsControlPointCharacteristic
+            else {
+                throw BluetoothError.notConnectedOrCharsMissing
+            }
+
+            guard installUploadedFirmwareContinuation == nil else {
+                throw FlySightCore.FirmwareUpdateBLEError.fileTransferOperationInProgress
+            }
+
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                installUploadedFirmwareContinuation = continuation
+                isInstallingUploadedFirmware = true
+
+                notificationHandlers[controlChar.uuid] = { [weak self] _, char, err in
+                    guard let self = self else { return }
+
+                    if let error = err {
+                        self.completeInstallUploadedFirmware(result: .failure(error))
+                        return
+                    }
+
+                    guard let data = char.value else { return }
+                    self.handleInstallUploadedFirmwareResponse(data)
+                }
+
+                peripheral.writeValue(
+                    FlySightCore.FirmwareUpdateBLECommands.installUploadedFirmware(),
+                    for: controlChar,
+                    type: .withResponse
+                )
+            }
+        }
+
+        private func handleInstallUploadedFirmwareResponse(_ data: Data) {
+            guard data.count >= 3 else {
+                completeInstallUploadedFirmware(result: .failure(FlySightCore.FirmwareUpdateBLEError.controlPointResponseTooShort))
+                return
+            }
+
+            let responseID = data[0]
+            guard responseID == FlySightCore.CP_RESPONSE_ID else {
+                completeInstallUploadedFirmware(result: .failure(FlySightCore.FirmwareUpdateBLEError.unexpectedControlPointResponse(responseID: responseID)))
+                return
+            }
+
+            let responseOpcode = data[1]
+            guard responseOpcode == FlySightCore.DSControlOpcodes.installUploadedFirmware else {
+                completeInstallUploadedFirmware(result: .failure(FlySightCore.FirmwareUpdateBLEError.unexpectedControlPointOpcode(expected: FlySightCore.DSControlOpcodes.installUploadedFirmware, actual: responseOpcode)))
+                return
+            }
+
+            let status = data[2]
+            guard status == FlySightCore.CP_STATUS.success else {
+                completeInstallUploadedFirmware(result: .failure(FlySightCore.FirmwareUpdateBLEError.controlPointRejected(status: status)))
+                return
+            }
+
+            completeInstallUploadedFirmware(result: .success(()))
+        }
+
+        private func completeInstallUploadedFirmware(result: Result<Void, Error>) {
+            installUploadedFirmwareContinuation?.resume(with: result)
+            installUploadedFirmwareContinuation = nil
+            isInstallingUploadedFirmware = false
+
+            if let controlChar = dsControlPointCharacteristic {
+                notificationHandlers[controlChar.uuid] = nil
             }
         }
 

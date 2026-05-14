@@ -34,6 +34,26 @@ public extension FlySightCore { // Also extends the FlySightCore enum namespace
         }
     }
 
+    // Constants for File Transfer (FT) command opcodes
+    struct FTControlOpcodes {
+        public static let delete: UInt8            = 0x01
+        public static let readFile: UInt8          = 0x02
+        public static let writeFileOpen: UInt8     = 0x03
+        public static let createDirectory: UInt8   = 0x04
+        public static let listDirectory: UInt8     = 0x05
+        public static let fileData: UInt8          = 0x10
+        public static let fileInfo: UInt8          = 0x11
+        public static let ackFileData: UInt8       = 0x12
+        public static let ping: UInt8              = 0xFE
+        public static let cancelTransfer: UInt8    = 0xFF
+    }
+
+    // Constants for File Transfer (FT) ACK/NAK responses
+    struct FTResponseOpcodes {
+        public static let nak: UInt8               = 0xF0
+        public static let ack: UInt8               = 0xF1
+    }
+
     // Constants for Sensor Data (SD) Control Point Opcodes
     struct SDControlOpcodes { // Renamed from GNSSControlOpcodes
         public static let setMask: UInt8            = 0x01 // SD_CMD_SET_GNSS_BLE_MASK
@@ -44,5 +64,10 @@ public extension FlySightCore { // Also extends the FlySightCore enum namespace
     struct SPControlOpcodes {
         public static let startCountdown: UInt8     = 0x01 // SP_CMD_START_COUNTDOWN
         public static let cancelCountdown: UInt8    = 0x02 // SP_CMD_CANCEL_COUNTDOWN
+    }
+
+    // Constants for Device State (DS) Control Point Opcodes
+    struct DSControlOpcodes {
+        public static let installUploadedFirmware: UInt8 = 0x04 // DS_CMD_INSTALL_UPLOADED_FIRMWARE
     }
 }
