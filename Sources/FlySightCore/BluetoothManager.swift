@@ -1225,7 +1225,9 @@ public extension FlySightCore {
                     transferCompleteSubject.send(completion: .failure(error))
                     return
                 }
-                guard let data = char.value, data.count >= 2, data[0] == 0x10 else {
+                guard let data = char.value,
+                      data.count >= 2,
+                      data[0] == FlySightCore.FTControlOpcodes.fileData else {
                     if let data = char.value,
                        data.count >= 2,
                        data[0] == FlySightCore.FTResponseOpcodes.nak,
@@ -1241,14 +1243,14 @@ public extension FlySightCore {
                     let actualData = data.count > 2 ? data.subdata(in: 2..<data.count) : Data()
 
                     if actualData.isEmpty && data.count == 2 {
-                        let ackPacket = Data([0x12, receivedPacketNum])
+                        let ackPacket = Data([FlySightCore.FTControlOpcodes.ackFileData, receivedPacketNum])
                         p.writeValue(ackPacket, for: rxChar, type: .withoutResponse)
                         transferCompleteSubject.send(completion: .finished)
                     } else {
                         fileData.append(actualData)
                         expectedPacketNum = expectedPacketNum &+ 1
 
-                        let ackPacket = Data([0x12, receivedPacketNum])
+                        let ackPacket = Data([FlySightCore.FTControlOpcodes.ackFileData, receivedPacketNum])
                         p.writeValue(ackPacket, for: rxChar, type: .withoutResponse)
 
                         DispatchQueue.main.async {
@@ -1296,7 +1298,7 @@ public extension FlySightCore {
 
         public func cancelDownload() {
             guard let peripheral = connectedPeripheralInfo?.peripheral, let char = ftPacketInCharacteristic else { return }
-            let cancelCommand = Data([0xFF])
+            let cancelCommand = Data([FlySightCore.FTControlOpcodes.cancelTransfer])
             peripheral.writeValue(cancelCommand, for: char, type: .withoutResponse)
             DispatchQueue.main.async {
                 self.downloadProgress = 0.0
@@ -1473,7 +1475,7 @@ public extension FlySightCore {
                     }
                 }
 
-                var openCommand = Data([0x03])
+                var openCommand = Data([FlySightCore.FTControlOpcodes.writeFileOpen])
                 openCommand.append(remotePath.data(using: .utf8) ?? Data())
                 openCommand.append(0x00)
 
@@ -1521,11 +1523,11 @@ public extension FlySightCore {
                     let startIndex = nextPacketNum * frameLength
                     let endIndex = min(startIndex + frameLength, dataToSend.count)
                     dataChunk = dataToSend.subdata(in: startIndex..<endIndex)
-                    packetData = Data([0x10, UInt8(nextPacketNum % 256)]) + dataChunk
+                    packetData = Data([FlySightCore.FTControlOpcodes.fileData, UInt8(nextPacketNum % 256)]) + dataChunk
                 } else if isFinalPacket {
                     guard nextAckNum >= dataPacketCount else { break }
 
-                    packetData = Data([0x10, UInt8(nextPacketNum % 256)])
+                    packetData = Data([FlySightCore.FTControlOpcodes.fileData, UInt8(nextPacketNum % 256)])
                     print("Upload: Preparing final empty packet #\(nextPacketNum % 256)")
                     lastPacketNum = nextPacketNum + 1
                 } else {
@@ -1536,8 +1538,6 @@ public extension FlySightCore {
                 nextPacketNum += 1
 
                 if isFinalPacket { break }
-
-                 try? await Task.sleep(nanoseconds: 30_000_000)
             }
         }
 
